@@ -1,0 +1,6 @@
+App: 1.0.12-tv32
+Base: fyworld/hongguoTV
+Base commit: b4ca43d55f4322126edd86465f43c59e7ac31e21
+SDK: openhongguo v0.2.0, 42b73f201309423f012d483bfc0ce579dcc0937c
+APK SHA256: 20f01d11bc6d4e373a082f8a07e5e85ba0a021e8ccf979a0b2b66f13c9734ccc
+32-bit Android 8+: VideoLAN libvlc-all 3.6.5

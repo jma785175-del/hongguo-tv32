@@ -1,0 +1,377 @@
+// Adapted 2026-10-27 from tsukiyo-zero/hongguoTV kotlin-tv (GPL-3.0-only).
+// Kotlin port of upstream HongguoTV-Phone-TV-NoAds 6e43927 (multi_video_model/v1);
+// GPL-3.0-only. See kotlin-tv/NOTICE.md.
+package com.hongguotv.core
+
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.IOException
+import java.util.Locale
+
+/**
+ * Primary channel: the playback model endpoint /novel/player/multi_video_model/v1/.
+ *
+ * 2026-10-27: the server started rejecting unregistered devices - every signed request
+ * from a random device_id now returns HTTP 200 + an EMPTY body (the same treatment the
+ * old lightweight signature got). The fix follows upstream tsukiyo-zero/hongguoTV
+ * kotlin-tv: register the device once via /service/2/device_register/ (anonymous,
+ * ttEncrypt(gzip(json)) body, NO signature headers), then call the playback endpoint
+ * with the server-issued device_id/install_id in the query and the registration
+ * cookies attached. No x-gorgon chain on the playback call itself.
+ *
+ * 2026-11-02: the server retired the POST /novel/player path entirely - all eight
+ * api5/api3 domains return HTTP 200 + 0 bytes for every request variant (upstream
+ * probed official UA, full signature headers, empty body, no cookie, h2/h1.1,
+ * browser and curl fingerprints). The official client now reads
+ * GET /reading/bookapi/video_tab/multi_video_model/v1/ (found in its RpcOperation;
+ * params are GetVideoModelRequest's snake_case fields - missing any returns
+ * 100103 PARAM_INVALID). This source tries the video_tab endpoint first (single
+ * attempt, main domain); on any failure it falls back to the old POST flow, whose
+ * empty-response retry and identity semantics stay unchanged. Known limits: the
+ * new endpoint serves bytevc2 lows + bytevc1 1080P only (after the bytevc2 filter
+ * just 1080P remains) and takes one video_id per call.
+ *
+ * Response shapes kept from the earlier migration:
+ *  - request body: biz_param + mixed_video_id_map (slot key fixed "1004",
+ *    video_platform fixed 1024; other values return code 100001)
+ *  - the response shape is not fixed: data[vid].video_model, data.video_model, or a
+ *    single-key entry; video_model may carry video_list directly or only a
+ *    fallback_api (plain GET -> video_info.data, addresses protected by key_seed)
+ */
+internal class MultiVideoModelStreamSource(
+    private val transport: AppApiTransport,
+    private val http: OkHttpClient,
+    private val session: PlaybackDeviceSession = PlaybackDeviceSession.shared,
+    private val host: String = "api5-normal-sinfonlineb.fqnovel.com",
+    /** Retry backoff injection point (tests pass a no-op so empty rounds stay instant). */
+    private val sleep: (Long) -> Unit = Thread::sleep,
+) : StreamSource {
+    override val name = "multi-video-model"
+
+    /** Upstream pins this UA on the playback call (Android 9 SM-N9860 profile). */
+    private val playbackUa =
+        "com.phoenix.read/71532 (Linux; U; Android 9; SM-N9860; Build/PQ3A.190705.10241111;tt-ok/3.12.13.20)"
+
+    /** Fallback_api hosts are pinned to the vendor's own domains (upstream keeps the same guard). */
+    private val fallbackDomains = listOf("fqnovel.com", "snssdk.com")
+
+    // 空响应身份屏蔽自愈状态（2026-11-01 事件实测：屏蔽按设备身份生效，换域名与新连接
+    // 无法逃逸，全新身份即时恢复）。连续整轮空响应达到阈值时轮换一次身份；任何一次成功
+    // 即复位。本类实例与 ContentRepository 同生命周期（主播放链单实例存活），prefetch
+    // 用的短命 ContentRepository 自带独立实例，计数互不串扰。
+    private val identityLock = Any()
+    private var emptyRounds = 0
+    private var rotatedThisPeriod = false
+
+    override fun stream(id: String, maxQuality: Int, type: ContentType): StreamInfo {
+        // Official client's current endpoint first (2026-11-02): the old POST path is
+        // retired server-side; video_tab serves the five-tier model on the same
+        // registered identity. Any failure falls through to the old flow below.
+        tabVideoModel(id, maxQuality)?.let {
+            // Any success (tab included) proves the identity works - reset the
+            // empty-round state so a later incident starts counting fresh.
+            resetIdentityHealing()
+            return it
+        }
+        val payload = JSONObject()
+            .put("biz_param", JSONObject()
+                .put("detail_page_version", 0)
+                .put("device_level", 3)
+                .put("disable_digg_stat", false)
+                .put("need_all_video_definition", true)
+                .put("need_mp4_align", false)
+                .put("use_os_player", false)
+                .put("use_server_dns", false)
+                .put("video_platform", 1024))
+            .put("mixed_video_id_map", JSONObject().put("1004", JSONArray().put(id)))
+        val body = payload.toString().toByteArray(Charsets.UTF_8)
+        // Identity-blocklist self-healing (upstream b597f28, 2026-11-01 event probes:
+        // empty responses block per device identity - no host or connection escape,
+        // a fresh identity recovers instantly): after two consecutive fully-empty
+        // rounds, rotate the anonymous identity once before this round.
+        maybeRotateIdentity()
+        // Registered identity: server-issued device_id/install_id + registration cookies.
+        val identity = session.profile(http)
+        val query = transport.encodeQuery(identity.values + mapOf("_rticket" to transport.clockMs().toString()))
+        val url = "https://$host$PATH?$query"
+        val data = try {
+            requestPlayback(url, body, identity.cookie)
+        } catch (error: EmptyPlaybackResponseException) {
+            // A fully-empty round counts toward rotation; tag the error once this
+            // failure period has rotated (screenshot shows "已换身份仍失败").
+            throw if (noteEmptyRound()) EmptyPlaybackResponseException("rotated=1") else error
+        }
+        resetIdentityHealing()
+        val map = data.optJSONObject("data") ?: throw IOException("播放信息为空")
+        val model = resolveModel(map, id)
+        if (hasVideoList(model)) return select(model, maxQuality, null)
+        // Second shape: only a fallback_api URL; plain GET (no signature) -> video_info.data.
+        val fallback = model.str("fallback_api")
+        if (fallback.isEmpty()) throw IOException("红果 App 接口未返回本集片源地址")
+        val outer = fallbackJson(fallback)
+        val info = outer.optJSONObject("video_info")
+        val inner = info?.optJSONObject("data") ?: outer.optJSONObject("data")
+            ?: throw IOException("红果 App 接口未返回本集片源模型")
+        // ByteVC2-compat model (upstream 265472f, issue #56): when EVERY offered variant
+        // is bytevc2/bvc2 (TV decoders can't handle them), re-request the same fallback
+        // URL with codec_type=0 + force_codec=h264 once - the official player's compat
+        // path. The params don't guarantee h264 (issue #56 actually returned hvc1), so
+        // selection below still judges by the actual codec labels.
+        val merged = JSONObject()
+        model.keys().forEach { k -> merged.put(k, model.get(k)) }
+        val compatInner = bytevc2CompatModel(inner, fallback)
+        val source = compatInner ?: inner
+        val seed = source.str("key_seed").takeIf { it.isNotEmpty() }?.let { s ->
+            runCatching { decode64(s) }.getOrNull() ?: throw IOException("红果 App 媒体地址密钥无效")
+        }
+        source.keys().forEach { k -> merged.put(k, source.get(k)) }
+        return select(merged, maxQuality, seed)
+    }
+
+    /**
+     * All-bytevc2 fallback compat request (upstream 265472f): returns the compat
+     * model's data object when every offered variant is bytevc2/bvc2, else null
+     * (keep the original). At most one extra request, no retry loop.
+     */
+    private fun bytevc2CompatModel(inner: JSONObject, fallback: String): JSONObject? {
+        val videoList = inner.optJSONObject("video_list") ?: return null
+        val offered = videoList.keys().asSequence().mapNotNull { videoList.optJSONObject(it) }.toList()
+        if (offered.isEmpty()) return null
+        if (!offered.all {
+                it.str("main_url").isNotBlank() &&
+                    it.str("codec_type").lowercase(Locale.ROOT) in setOf("bytevc2", "bvc2")
+            }) return null
+        val compatible = fallback.toHttpUrl().newBuilder()
+            .setQueryParameter("codec_type", "0")
+            .setQueryParameter("force_codec", "h264")
+            .build().toString()
+        val outer = fallbackJson(compatible)
+        return outer.optJSONObject("video_info")?.optJSONObject("data")
+            ?: outer.optJSONObject("data")
+    }
+
+    /**
+     * The official client's current playback-model endpoint:
+     * GET /reading/bookapi/video_tab/multi_video_model/v1/ (2026-11-02).
+     *
+     * Single attempt on the main domain - the old POST flow below still has its own
+     * bounded retry, so re-trying here buys nothing. Any failure (non-zero code, empty
+     * body, unexpected shape, network error) returns null and the caller falls back;
+     * empty-response semantics stay owned by the old path.
+     */
+    private fun tabVideoModel(id: String, maxQuality: Int): StreamInfo? {
+        val extra = mapOf("video_id" to id,"video_id_type" to "0","device_level" to "1",
+            "need_all_video_definition" to "1","need_mp4_align" to "0","use_os_player" to "0",
+            "video_platform" to "1024","source" to "0","from_video_id" to "")
+        return try {
+            val identity = session.profile(http)
+            val signed=transport.sign("https://$host$TAB_PATH",identity.values+extra,null,playbackUa)
+            val request = Request.Builder()
+                .url(signed.url)
+                .apply { signed.headers.forEach { (key,value) -> header(key,value) } }
+                .apply { if (identity.cookie.isNotBlank()) header("Cookie", identity.cookie) }
+                .get()
+                .build()
+            val text = RequestScope.execute(http.newCall(request)) { response ->
+                if (!response.isSuccessful) throw IOException("video_tab HTTP ${response.code}")
+                response.body?.string().orEmpty()
+            }
+            val root = JSONObject(text)
+            if (root.optInt("code", root.optInt("Code", -1)) != 0) return null
+            val data = root.optJSONObject("data") ?: return null
+            val rows = data.optJSONObject("video_model_data") ?: data
+            val row = rows.optJSONObject(id)
+                ?: rows.keys().asSequence().mapNotNull { rows.optJSONObject(it) }.firstOrNull()
+                ?: return null
+            val raw = row.opt("video_model") ?: return null
+            val model = when (raw) {
+                is JSONObject -> raw
+                is String -> runCatching { JSONObject(raw) }.getOrNull()
+                else -> null
+            } ?: return null
+            if (!hasVideoList(model)) return null
+            select(model, maxQuality, null)
+        } catch (e: IOException) {
+            null
+        } catch (e: RuntimeException) {
+            null
+        }
+    }
+
+    /**
+     * Rotate the anonymous identity once per failure period: after two consecutive
+     * fully-empty rounds (each round = 3 attempts across the retry loop below, so
+     * two rounds ≈ 8 requests over ~25s in upstream terms) and before the next
+     * round starts. Whether the re-registration succeeds or not, this failure
+     * period never rotates again; any success resets the whole state.
+     */
+    private fun maybeRotateIdentity() {
+        val shouldRotate = synchronized(identityLock) {
+            emptyRounds >= IDENTITY_ROTATE_ROUNDS && !rotatedThisPeriod
+        }
+        if (!shouldRotate) return
+        // Network I/O outside the lock; success or failure, this period is done rotating.
+        session.rotate(http)
+        synchronized(identityLock) { rotatedThisPeriod = true }
+    }
+
+    /** One more fully-empty round: returns true when this period has already rotated. */
+    private fun noteEmptyRound(): Boolean {
+        synchronized(identityLock) {
+            emptyRounds += 1
+            return rotatedThisPeriod
+        }
+    }
+
+    /** Any playback success (tab or POST path) resets the healing state. */
+    private fun resetIdentityHealing() {
+        synchronized(identityLock) {
+            emptyRounds = 0
+            rotatedThisPeriod = false
+        }
+    }
+
+    /**
+     * The playback call: registered query + cookies, no signature chain. Empty bodies
+     * are the server's "device not recognized" answer - retry a bounded number of
+     * times with a fresh _rticket before surfacing the error (upstream does the same).
+     */
+    private fun requestPlayback(url: String, body: ByteArray, cookie: String): JSONObject {
+        var lastError: IOException? = null
+        for (attempt in 0..2) {
+            val freshUrl = if (attempt == 0) url
+                else url.substringBefore("?") + "?" + transport.encodeQuery(
+                    transport.parseQuery(url) + mapOf("_rticket" to transport.clockMs().toString()))
+            try {
+                val signed=transport.sign(freshUrl.substringBefore("?"),transport.parseQuery(freshUrl),body,playbackUa)
+                val request = Request.Builder().url(signed.url)
+                    .apply { signed.headers.forEach { (key,value) -> header(key,value) } }
+                    .apply { if (cookie.isNotBlank()) header("Cookie", cookie) }
+                    .post(body.toRequestBody("application/json; charset=utf-8".toMediaType()))
+                    .build()
+                return RequestScope.execute(http.newCall(request)) { response ->
+                    if (!response.isSuccessful) throw IOException("播放接口请求失败（HTTP ${response.code}）")
+                    val text = response.body?.string() ?: throw IOException("播放接口响应为空")
+                    if (text.isBlank()) throw EmptyPlaybackResponseException()
+                    val data = try { JSONObject(text) } catch(error: org.json.JSONException) {
+                        throw IOException("播放接口返回了无法解析的内容",error)
+                    }
+                    val code = data.optInt("code", data.optInt("Code", 0))
+                    if (code != 0) throw IOException("播放接口暂不可用（$code）")
+                    data
+                }
+            } catch (e: EmptyPlaybackResponseException) {
+                lastError = e
+                if (attempt < 2) sleep(700L * (attempt + 1))
+            } catch (e: IOException) {
+                // Transient network blips get one retry; everything else surfaces now.
+                val transient = e is java.net.SocketTimeoutException || e is java.net.SocketException
+                if (!transient || attempt > 0) throw e
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("播放接口返回空数据")
+    }
+
+    /** Three response shapes: data[vid].video_model, data.video_model, single-key entry. */
+    private fun resolveModel(data: JSONObject, id: String): JSONObject {
+        data.optJSONObject(id)?.let { entry ->
+            entry.opt("video_model")?.let { return normalizeModel(it) }
+        }
+        data.opt("video_model")?.let { return normalizeModel(it) }
+        for (key in data.keys()) {
+            val entry = data.optJSONObject(key) ?: continue
+            val candidate = entry.opt("video_model") ?: continue
+            runCatching { return normalizeModel(candidate) }
+        }
+        throw IOException("红果 App 接口未返回该集播放信息")
+    }
+
+    private fun normalizeModel(value: Any): JSONObject = when (value) {
+        is JSONObject -> value
+        is String -> JSONObject(value)
+        else -> throw IOException("播放信息格式异常")
+    }
+
+    private fun hasVideoList(model: JSONObject): Boolean {
+        model.optJSONObject("video_list")?.let { return it.length() > 0 }
+        model.optJSONArray("video_list")?.let { return it.length() > 0 }
+        return false
+    }
+
+    /** Plain GET on the fallback_api host (no signature headers, UA only). */
+    private fun fallbackJson(rawUrl: String): JSONObject {
+        val host = rawUrl.substringAfter("https://", "").substringBefore('/').lowercase(Locale.ROOT)
+        if (!fallbackDomains.any { host == it || host.endsWith(".$it") }) throw IOException("红果片源地址不在允许的域名内")
+        val request = Request.Builder().url(rawUrl)
+            .header("User-Agent", playbackUa)
+            .header("Accept", "application/json")
+            .build()
+        return RequestScope.execute(http.newCall(request)) { response ->
+            if (!response.isSuccessful) throw IOException("红果片源接口 HTTP ${response.code}")
+            val text = response.body?.string() ?: throw IOException("红果片源接口返回空正文")
+            if (text.isEmpty()) throw IOException("红果片源接口返回空正文")
+            JSONObject(text)
+        }
+    }
+
+    /** Pick a variant from video_list; decrypt key_seed-protected addresses when present. */
+    private fun select(model: JSONObject, maxQuality: Int, seed: ByteArray?): StreamInfo {
+        val videoList = model.optJSONObject("video_list") ?: run {
+            val list = model.optJSONArray("video_list")
+            if (list != null) { val obj = JSONObject(); for (i in 0 until list.length()) obj.put("$i", list.getJSONObject(i)); obj }
+            else throw IOException("没有可用清晰度")
+        }
+        val rows = videoList.keys().asSequence().mapNotNull { videoList.optJSONObject(it) }
+            .map { o ->
+                val meta = o.optJSONObject("video_meta")
+                val codec = (meta?.str("codec_type") ?: o.str("codec_type")).lowercase(Locale.ROOT)
+                val definition = (meta?.str("definition") ?: o.str("definition")).substringBefore('p').toIntOrNull() ?: 0
+                val height = (meta?.str("vheight") ?: o.str("vheight")).toIntOrNull() ?: 0
+                val width = (meta?.str("vwidth") ?: o.str("vwidth")).toIntOrNull() ?: 0
+                val quality = if (definition > 0) definition else if (width > 0 && (height == 0 || width < height)) width else height
+                Triple(quality, codec, o)
+            }.sortedByDescending { it.first }.toList()
+        val playable = rows.filter { it.second !in setOf("bytevc2", "bvc2") }
+        val compatible = playable.filter { it.second == "h264" || it.second == "avc1" }
+        val pool = if (compatible.isNotEmpty()) compatible else playable
+        val selected = pool.firstOrNull { it.first in 1..maxQuality } ?: pool.firstOrNull()
+            ?: throw IOException("没有电视可播放的清晰度，请稍后再试或选择其他剧集")
+        val item = selected.third
+        var url = cleanUrl(item.str("main_url"))
+        if (!url.startsWith("https://") && !url.startsWith("http://")) {
+            // main_url may be base64, or key_seed-encrypted (spade layout a8 .. 01 00)
+            val decoded = runCatching { decode64(url) }.getOrNull()
+            val plain = when {
+                decoded != null && seed != null && decoded.size >= 5 && decoded[0].u() == 0xa8 ->
+                    runCatching { MediaCrypto.decryptUrl(url, seed) }.getOrNull()
+                else -> null
+            } ?: decoded?.let { runCatching { String(it, Charsets.UTF_8).trim() }.getOrNull() }
+            if (plain != null && (plain.startsWith("https://") || plain.startsWith("http://"))) url = plain
+            else throw IOException("播放地址无效")
+        }
+        val encryption = item.optJSONObject("encrypt_info")
+        val spade = encryption?.str("spade_a")?.ifEmpty { item.str("spade_a") } ?: item.str("spade_a")
+        val key = if (spade.isNotEmpty()) runCatching { MediaCrypto.deriveKey(spade) }.getOrNull() else null
+        val quality = if (selected.first > 0) "${selected.first}P" + (if (selected.first > maxQuality) "（兼容资源）" else "") else "自动"
+        return StreamInfo(url, key, quality)
+    }
+
+    companion object {
+        const val PATH = "/novel/player/multi_video_model/v1/"
+
+        /** Official client's current playback-model path (2026-11-02 migration). */
+        const val TAB_PATH = "/reading/bookapi/video_tab/multi_video_model/v1/"
+
+        /** Consecutive fully-empty rounds before one identity rotation (upstream b597f28). */
+        internal const val IDENTITY_ROTATE_ROUNDS = 2
+    }
+}
+
+internal class EmptyPlaybackResponseException(val detail: String? = null) :
+    IOException("播放接口暂时返回空响应，请稍后重试" + (if (detail != null) "（$detail）" else ""))
